@@ -146,6 +146,7 @@ func (ctx *builderCtx) HasLocalVar(symbol string) (pos int, ok bool) {
 func (ctx *builderCtx) DeclareLocalVar(symbol string) int {
   frame := ctx.CurrentFrame()
   i := frame.DeclareVar(symbol)
+fmt.Printf("Declared local variable '%s' at '%d'\n", symbol, i)
   frame.LvarNames[symbol] = i
   return i
 }
@@ -153,6 +154,7 @@ func (ctx *builderCtx) DeclareLocalVar(symbol string) int {
 func (ctx *builderCtx) PushFrame() *Frame {
   f := NewFrame(ctx.FrameStack)
   ctx.Frames.Push(f)
+  f.SetMark(ctx.Frames.Cur())
   return f
 }
 
@@ -178,6 +180,7 @@ func (ctx *builderCtx) CurrentFrame() *Frame {
 }
 
 func (ctx *builderCtx) PushParentNode(n NodeAppender) {
+fmt.Printf("PushParentNode %s\n", n)
   frame := ctx.PushFrame()
   frame.Node = n
 }
@@ -296,10 +299,12 @@ func (b *Builder) ParseTemplate(ctx *builderCtx) Node {
     // no op
   case ItemCall:
     b.NextNonSpace(ctx)
-    tmpl = b.ParseExpressionOrAssignment(ctx)
+    tmpl = b.ParseExpressionOrAssignment(ctx, false)
   case ItemSet:
     b.NextNonSpace(ctx) // Consume SET
     tmpl = b.ParseAssignment(ctx)
+  case ItemMacro:
+    tmpl = b.ParseMacro(ctx)
   case ItemWrapper:
     tmpl = b.ParseWrapper(ctx)
   case ItemForeach:
@@ -312,7 +317,7 @@ func (b *Builder) ParseTemplate(ctx *builderCtx) Node {
     b.NextNonSpace(ctx)
     tmpl = NewNoopNode()
   case ItemIdentifier, ItemNumber, ItemDoubleQuotedString, ItemSingleQuotedString, ItemOpenParen:
-    tmpl = b.ParseExpressionOrAssignment(ctx)
+    tmpl = b.ParseExpressionOrAssignment(ctx, true)
   case ItemIf:
     tmpl = b.ParseIf(ctx)
   case ItemElse:
@@ -338,7 +343,7 @@ func (b *Builder) ParseTemplate(ctx *builderCtx) Node {
   return tmpl
 }
 
-func (b *Builder) ParseExpressionOrAssignment(ctx *builderCtx) Node {
+func (b *Builder) ParseExpressionOrAssignment(ctx *builderCtx, canPrint bool) Node {
   // There's a special case for assignment where SET is omitted
   // [% foo = ... %] instead of [% SET foo = ... %]
   next := b.NextNonSpace(ctx)
@@ -352,10 +357,10 @@ func (b *Builder) ParseExpressionOrAssignment(ctx *builderCtx) Node {
       // This is a simple assignment!
       n = b.ParseAssignment(ctx)
     default:
-      n = b.ParseExpression(ctx, true)
+      n = b.ParseExpression(ctx, canPrint)
     }
   } else {
-    n = b.ParseExpression(ctx, true)
+    n = b.ParseExpression(ctx, canPrint)
   }
 
   return n
@@ -465,7 +470,8 @@ func (b *Builder) LocalVarOrFetchSymbol(ctx *builderCtx, token lex.LexItem) Node
 }
 
 func (b *Builder) ParseTerm(ctx *builderCtx) Node {
-  switch token := b.NextNonSpace(ctx); token.Type() {
+  token := b.NextNonSpace(ctx)
+  switch token.Type() {
   case ItemIdentifier:
     return b.LocalVarOrFetchSymbol(ctx, token)
   case ItemNumber, ItemDoubleQuotedString, ItemSingleQuotedString:
@@ -488,6 +494,7 @@ func (b *Builder) ParseFunCall(ctx *builderCtx, invocant Node) Node {
   if closeParen.Type() != ItemCloseParen {
     b.Unexpected(ctx, "Expected ')', got %s", closeParen.Type())
   }
+
   return NewFunCallNode(invocant.Pos(), invocant, args.(*ListNode))
 }
 
@@ -706,6 +713,8 @@ func (b *Builder) ParseForeach(ctx *builderCtx) Node {
   }
 
   forNode := NewForeachNode(foreach.Pos(), localsym.Value())
+  // use current frame mark
+  forNode.IndexVarIdx = ctx.CurrentFrame().Mark()
 
   in := b.NextNonSpace(ctx)
   if in.Type() != ItemIn {
@@ -740,9 +749,9 @@ func (b *Builder) ParseWhile(ctx *builderCtx) Node {
 }
 
 func (b *Builder) ParseRange(ctx *builderCtx) Node {
-  start := b.NextNonSpace(ctx)
-  if start.Type() != ItemNumber {
-    b.Unexpected(ctx, "Expected number, got %s", start.Value())
+  start := b.ParseTerm(ctx)
+  if start == nil {
+    b.Unexpected(ctx, "Expected term (start range), got %s", b.PeekNonSpace(ctx).Value())
   }
 
   rangeOp := b.NextNonSpace(ctx)
@@ -750,14 +759,12 @@ func (b *Builder) ParseRange(ctx *builderCtx) Node {
     b.Unexpected(ctx, "Expected range, got %s", rangeOp.Value())
   }
 
-  end := b.NextNonSpace(ctx)
-  if end.Type() != ItemNumber {
-    b.Unexpected(ctx, "Expected number, got %s", end.Value())
+  end := b.ParseTerm(ctx)
+  if end == nil {
+    b.Unexpected(ctx, "Expected term (end range), got %s", b.PeekNonSpace(ctx).Value())
   }
 
-  startN, _ := strconv.ParseInt(start.Value(), 10, 64)
-  endN, _   := strconv.ParseInt(end.Value(), 10, 64)
-  return NewRangeNode(start.Pos(), int(startN), int(endN))
+  return NewRangeNode(start.Pos(), start, end)
 }
 
 func (b *Builder) ParseListVariableOrMakeArray(ctx *builderCtx) Node {
@@ -931,4 +938,56 @@ func (b *Builder) ParseGroup(ctx *builderCtx) Node {
   }
 
   return n
+}
+
+func (b *Builder) ParseMacro(ctx *builderCtx) Node {
+  macroToken := b.NextNonSpace(ctx)
+  if macroToken.Type() != ItemMacro {
+    b.Unexpected(ctx, "Expected 'MACRO', got %s", macroToken)
+  }
+
+  // Parse name, and arguments.
+  nameToken := b.NextNonSpace(ctx)
+  if nameToken.Type() != ItemIdentifier {
+    b.Unexpected(ctx, "Expected identifier, got %s", nameToken)
+  }
+
+  idx := ctx.DeclareLocalVar(nameToken.Value())
+
+  macro := NewMacroNode(nameToken.Pos(), nameToken.Value())
+  macro.LocalVar = NewLocalVarNode(nameToken.Pos(), nameToken.Value(), idx)
+  ctx.CurrentParentNode().Append(macro)
+  ctx.PushParentNode(macro)
+
+  // either a '(' followed by argument list, or BLOCK
+  if b.PeekNonSpace(ctx).Type() ==  ItemOpenParen {
+    b.NextNonSpace(ctx) // discard open paren
+    // Can't use ParseList() here, because we want a list of only identifiers
+    for {
+      next := b.NextNonSpace(ctx)
+      if next.Type() != ItemIdentifier {
+        b.Backup(ctx)
+        break
+      }
+
+//      idx := ctx.DeclareLocalVar(next.Value())
+//      macro.AppendArg(NewLocalVarNode(next.Pos(), next.Value(), idx))
+
+      next = b.NextNonSpace(ctx)
+      if next.Type() != ItemComma {
+        b.Backup(ctx)
+        break
+      }
+    }
+    if closeParen := b.NextNonSpace(ctx); closeParen.Type() != ItemCloseParen {
+      b.Unexpected(ctx, "Expected ')', got %s", closeParen)
+    }
+  }
+
+  // Then we need a BLOCK
+  if block := b.NextNonSpace(ctx); block.Type() != ItemBlock {
+    b.Unexpected(ctx, "Expected BLOCK, got %s", block)
+  }
+
+  return nil
 }
